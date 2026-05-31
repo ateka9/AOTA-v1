@@ -1,131 +1,82 @@
 """
-AOTA v1 — Production-hardened API engine.
+LLM Availability Feed — Production API (v2)
 
-This module is the implementation glue between the FMEA audit
-(AOTA_Audit_Report.md) and a deployable service. Every resilience
-primitive maps directly to a mitigation in Section 3 of the audit:
-
-    async_retry        -> 3.1   (F-09, F-02)
-    CircuitBreaker     -> 3.2   (F-03, F-09, F-10)
-    StalenessGuard     -> 3.3   (F-01, F-05, F-11, F-12)
-    compute_aggregate  -> 3.4   (F-11)
-    CollectorWatchdog  -> 3.5   (F-06)
-    collection_cycle   -> 3.6   (keep-last-good)
-    LocalCache         -> 3.7   (F-03, F-10)
-    /v1/telemetry      -> 3.8   (F-04, F-07, F-08, F-13, F-15)
-    /health            -> 3.9   (F-04, F-06)
-    /v1/provision      -> revenue loop (Stripe -> Redis -> email)
-
-Nothing here trusts a dependency. The source lies, Redis evicts,
-the scheduler dies — and the API still answers with correct HTTP
-semantics and an honest staleness signal.
+Probes every 60 seconds:
+  OpenAI, Anthropic, Cohere, Mistral, Groq,
+  Together AI, Perplexity, Replicate, Hugging Face
 """
-
 from __future__ import annotations
-
-import asyncio
-import functools
-import hashlib
-import hmac
-import json
-import logging
-import os
-import random
-import secrets
-import time
+import asyncio, functools, hashlib, json, logging, os, random, secrets, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Awaitable, Callable, Optional, TypeVar
-
 import httpx
 import redis.asyncio as aioredis
 import stripe
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 
-# --------------------------------------------------------------------------- #
-# Configuration (all secrets from env — never hardcode; see render.yaml)
-# --------------------------------------------------------------------------- #
+LLM_PROVIDERS = [
+    {"id": "openai",      "label": "OpenAI",       "url": "https://status.openai.com/api/v2/summary.json"},
+    {"id": "anthropic",   "label": "Anthropic",     "url": "https://status.anthropic.com/api/v2/summary.json"},
+    {"id": "cohere",      "label": "Cohere",        "url": "https://status.cohere.com/api/v2/summary.json"},
+    {"id": "mistral",     "label": "Mistral",       "url": "https://mistralstatus.com/api/v2/summary.json"},
+    {"id": "groq",        "label": "Groq",          "url": "https://groqstatus.com/api/v2/summary.json"},
+    {"id": "together",    "label": "Together AI",   "url": "https://status.together.ai/api/v2/summary.json"},
+    {"id": "perplexity",  "label": "Perplexity",    "url": "https://status.perplexity.ai/api/v2/summary.json"},
+    {"id": "replicate",   "label": "Replicate",     "url": "https://replicatestatus.com/api/v2/summary.json"},
+    {"id": "huggingface", "label": "Hugging Face",  "url": "https://status.huggingface.co/api/v2/summary.json"},
+]
 
-REDIS_URL = os.environ["UPSTASH_REDIS_URL"]
-SOURCE_URL = os.environ["SOURCE_PORTAL_URL"]
-STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "")
+INDICATOR_MAP = {
+    "none": "operational", "minor": "degraded_performance",
+    "major": "major_outage", "critical": "major_outage", "maintenance": "under_maintenance",
+}
+
+REDIS_URL             = os.environ["UPSTASH_REDIS_URL"]
+STRIPE_API_KEY        = os.environ.get("STRIPE_API_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-FROM_EMAIL = os.environ.get("FROM_EMAIL", "keys@aota.example")
-
-COLLECT_INTERVAL_S = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
-CACHE_TTL_S = int(os.environ.get("CACHE_TTL_S", "55"))
-LOCAL_FRESH_S = int(os.environ.get("LOCAL_FRESH_S", "50"))
-MAX_DATA_AGE_S = int(os.environ.get("MAX_DATA_AGE_S", "180"))
-SCHEMA_VERSION = "1.0.0"
+RESEND_API_KEY        = os.environ.get("RESEND_API_KEY", "")
+FROM_EMAIL            = os.environ.get("FROM_EMAIL", "keys@llmfeed.example")
+COLLECT_INTERVAL_S    = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
+CACHE_TTL_S           = int(os.environ.get("CACHE_TTL_S", "55"))
+LOCAL_FRESH_S         = int(os.environ.get("LOCAL_FRESH_S", "50"))
+MAX_DATA_AGE_S        = int(os.environ.get("MAX_DATA_AGE_S", "180"))
+SCHEMA_VERSION        = "2.0.0"
 
 stripe.api_key = STRIPE_API_KEY
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("aota")
-
+log = logging.getLogger("llmfeed")
 T = TypeVar("T")
 
-# --------------------------------------------------------------------------- #
-# 3.1  Retry with exponential backoff + jitter        (mitigates F-09, F-02)
-# --------------------------------------------------------------------------- #
-
-
-def async_retry(
-    max_attempts: int = 4,
-    base_delay: float = 0.5,
-    max_delay: float = 8.0,
-    timeout: float = 5.0,
-    retry_on: tuple = (Exception,),
-):
-    """Retry an async callable with capped exponential backoff and full jitter.
-    The per-attempt timeout stops a slow source (F-09) blocking the cron cycle."""
-
+def async_retry(max_attempts=3, base_delay=0.5, max_delay=4.0, timeout=8.0):
     def decorator(func: Callable[..., Awaitable[T]]):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs) -> T:
-            last_exc: Optional[BaseException] = None
+            last_exc = None
             for attempt in range(max_attempts):
                 try:
                     return await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
-                except retry_on as exc:
+                except Exception as exc:
                     last_exc = exc
                     if attempt == max_attempts - 1:
                         break
-                    ceiling = min(max_delay, base_delay * (2 ** attempt))
-                    await asyncio.sleep(random.uniform(0, ceiling))
-            assert last_exc is not None
+                    await asyncio.sleep(random.uniform(0, min(max_delay, base_delay * (2 ** attempt))))
             raise last_exc
-
         return wrapper
-
     return decorator
 
-
-# --------------------------------------------------------------------------- #
-# 3.2  Circuit breaker                              (mitigates F-03, F-09, F-10)
-# --------------------------------------------------------------------------- #
-
-
 class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
+    CLOSED = "closed"; OPEN = "open"; HALF_OPEN = "half_open"
 
 class CircuitBreaker:
-    def __init__(self, fail_threshold: int = 5, cooldown: float = 30.0):
-        self.fail_threshold = fail_threshold
-        self.cooldown = cooldown
-        self.failures = 0
-        self.state = CircuitState.CLOSED
-        self.opened_at = 0.0
-        self._lock = asyncio.Lock()
-
+    def __init__(self, fail_threshold=5, cooldown=30.0):
+        self.fail_threshold = fail_threshold; self.cooldown = cooldown
+        self.failures = 0; self.state = CircuitState.CLOSED
+        self.opened_at = 0.0; self._lock = asyncio.Lock()
     async def call(self, coro_func, *args, **kwargs):
         async with self._lock:
             if self.state == CircuitState.OPEN:
@@ -139,276 +90,148 @@ class CircuitBreaker:
             async with self._lock:
                 self.failures += 1
                 if self.failures >= self.fail_threshold:
-                    self.state = CircuitState.OPEN
-                    self.opened_at = time.monotonic()
+                    self.state = CircuitState.OPEN; self.opened_at = time.monotonic()
             raise
         else:
             async with self._lock:
-                self.failures = 0
-                self.state = CircuitState.CLOSED
+                self.failures = 0; self.state = CircuitState.CLOSED
             return result
 
-
-source_breaker = CircuitBreaker(fail_threshold=5, cooldown=30.0)
 redis_breaker = CircuitBreaker(fail_threshold=3, cooldown=15.0)
 
-
-# --------------------------------------------------------------------------- #
-# Pydantic models — one frozen shape, used for BOTH validation and output
-# (3.3 structural validation + 3.8 schema stability F-07/F-13)
-# --------------------------------------------------------------------------- #
-
-
-class ProbeModel(BaseModel):
-    probe_id: str
-    target_label: str
-    status_code: int
-    reachable: bool
-    latency_ms: float
-    probe_timestamp: datetime
-    tls_valid: Optional[bool] = None
-    tls_expires_in_days: Optional[int] = None
-
-    @field_validator("status_code")
-    @classmethod
-    def status_in_range(cls, v: int) -> int:
-        if not (100 <= v <= 599):  # F-11
-            raise ValueError(f"status_code out of range: {v}")
-        return v
-
+class ProviderProbe(BaseModel):
+    provider_id: str; provider_label: str; status: str; indicator: str
+    reachable: bool; latency_ms: Optional[float]
+    active_incidents: int; active_components: int; probe_timestamp: datetime
     @field_validator("latency_ms")
     @classmethod
-    def latency_sane(cls, v: float) -> float:
-        if v < 0 or v > 120_000:  # F-11
+    def latency_sane(cls, v):
+        if v is not None and (v < 0 or v > 120_000):
             raise ValueError(f"latency_ms implausible: {v}")
         return v
 
+class FeedAggregate(BaseModel):
+    total_providers: int; operational_count: int; degraded_count: int
+    outage_count: int; unreachable_count: int; total_active_incidents: int
+    avg_latency_ms: Optional[float]; collection_duration_ms: float
 
-class Aggregate(BaseModel):
-    total_probes: int
-    reachable_count: int
-    unreachable_count: int
-    avg_latency_ms: Optional[float] = None
-    p95_latency_ms: Optional[float] = None
-    collection_duration_ms: Optional[float] = None
-
-
-class TelemetrySnapshot(BaseModel):
-    snapshot_id: str
-    collected_at: datetime
-    ttl_seconds: int
+class LLMFeedSnapshot(BaseModel):
+    snapshot_id: str; collected_at: datetime; ttl_seconds: int
     schema_version: str = SCHEMA_VERSION
-    probes: list[ProbeModel]
-    aggregate: Aggregate
-
-
-# --------------------------------------------------------------------------- #
-# 3.3  Data-integrity validation            (mitigates F-01, F-05, F-11, F-12)
-# --------------------------------------------------------------------------- #
-
+    providers: list[ProviderProbe]; aggregate: FeedAggregate
 
 class StalenessGuard:
-    """Detects frozen upstream (F-01) and stuck/skewed clocks (F-12)."""
-
-    def __init__(self, max_age_seconds: int = MAX_DATA_AGE_S):
-        self.last_hash: Optional[str] = None
-        self.last_change_at: float = time.monotonic()
-        self.max_age_seconds = max_age_seconds
-
-    def check(self, probes: list[dict]) -> list[ProbeModel]:
-        if not probes:  # F-11
-            raise ValueError("empty probe set")
-
-        validated = [ProbeModel(**p) for p in probes]  # F-05 schema drift
-
+    def __init__(self):
+        self.last_hash = None; self.last_change_at = time.monotonic()
+    def check(self, probes):
+        if not probes: raise ValueError("empty probe set")
         now = datetime.now(timezone.utc)
-        for p in validated:  # F-12 skew / stuck clock
+        for p in probes:
             ts = p.probe_timestamp.astimezone(timezone.utc)
-            if abs((now - ts).total_seconds()) > self.max_age_seconds:
-                raise ValueError(f"probe_timestamp too old/skewed: {ts.isoformat()}")
-
-        payload_hash = hashlib.sha256(
-            json.dumps(
-                [p.model_dump(mode="json") for p in validated], sort_keys=True
-            ).encode()
-        ).hexdigest()
-
-        if payload_hash == self.last_hash:  # F-01 frozen source
-            frozen_for = time.monotonic() - self.last_change_at
-            if frozen_for > self.max_age_seconds:
-                raise ValueError(f"source frozen for {int(frozen_for)}s — identical payload")
+            if abs((now - ts).total_seconds()) > MAX_DATA_AGE_S:
+                raise ValueError(f"probe_timestamp skewed: {ts.isoformat()}")
+        h = hashlib.sha256(json.dumps([p.model_dump(mode="json") for p in probes], sort_keys=True, default=str).encode()).hexdigest()
+        if h == self.last_hash:
+            if time.monotonic() - self.last_change_at > MAX_DATA_AGE_S:
+                raise ValueError("feed frozen")
         else:
-            self.last_hash = payload_hash
-            self.last_change_at = time.monotonic()
-
-        return validated
-
+            self.last_hash = h; self.last_change_at = time.monotonic()
 
 guard = StalenessGuard()
 
-
-# --------------------------------------------------------------------------- #
-# 3.4  Safe aggregate computation                          (mitigates F-11)
-# --------------------------------------------------------------------------- #
-
-
-def compute_aggregate(probes: list[ProbeModel], duration_ms: float) -> Aggregate:
-    n = len(probes)
-    reachable = [p for p in probes if p.reachable]
-    latencies = sorted(p.latency_ms for p in probes if p.latency_ms is not None)
-
-    def p95(values: list[float]) -> Optional[float]:
-        if not values:
-            return None
-        idx = max(0, int(round(0.95 * (len(values) - 1))))
-        return round(values[idx], 3)
-
-    return Aggregate(
-        total_probes=n,
-        reachable_count=len(reachable),
-        unreachable_count=n - len(reachable),
-        avg_latency_ms=round(sum(latencies) / len(latencies), 3) if latencies else None,
-        p95_latency_ms=p95(latencies),
-        collection_duration_ms=round(duration_ms, 3),
+def compute_aggregate(probes, duration_ms):
+    lats = [p.latency_ms for p in probes if p.latency_ms is not None]
+    return FeedAggregate(
+        total_providers=len(probes),
+        operational_count=sum(1 for p in probes if p.status == "operational"),
+        degraded_count=sum(1 for p in probes if p.status == "degraded_performance"),
+        outage_count=sum(1 for p in probes if p.status == "major_outage"),
+        unreachable_count=sum(1 for p in probes if not p.reachable),
+        total_active_incidents=sum(p.active_incidents for p in probes),
+        avg_latency_ms=round(sum(lats)/len(lats), 2) if lats else None,
+        collection_duration_ms=round(duration_ms, 2),
     )
 
-
-# --------------------------------------------------------------------------- #
-# 3.5  Scheduler watchdog                                  (mitigates F-06)
-# --------------------------------------------------------------------------- #
-
-
 class CollectorWatchdog:
-    def __init__(self):
-        self.last_success_ts: float = 0.0
-        self.consecutive_failures: int = 0
-
-    def record_success(self):
-        self.last_success_ts = time.time()
-        self.consecutive_failures = 0
-
-    def record_failure(self):
-        self.consecutive_failures += 1
-
-    def seconds_since_success(self) -> float:
-        return time.time() - self.last_success_ts if self.last_success_ts else float("inf")
-
-    def is_healthy(self, max_gap: float = float(MAX_DATA_AGE_S)) -> bool:
-        return self.seconds_since_success() < max_gap
-
+    def __init__(self): self.last_success_ts = 0.0; self.consecutive_failures = 0
+    def record_success(self): self.last_success_ts = time.time(); self.consecutive_failures = 0
+    def record_failure(self): self.consecutive_failures += 1
+    def seconds_since_success(self): return time.time() - self.last_success_ts if self.last_success_ts else float("inf")
+    def is_healthy(self): return self.seconds_since_success() < MAX_DATA_AGE_S
 
 watchdog = CollectorWatchdog()
 
-
-# --------------------------------------------------------------------------- #
-# 3.7  Local read-through cache                       (mitigates F-03, F-10)
-# --------------------------------------------------------------------------- #
-
-
 class LocalCache:
-    def __init__(self):
-        self.value: Optional[dict] = None
-        self.written_at: float = 0.0
-
-    def set(self, value: dict):
-        self.value = value
-        self.written_at = time.monotonic()
-
-    def age(self) -> float:
-        return time.monotonic() - self.written_at if self.value else float("inf")
-
+    def __init__(self): self.value = None; self.written_at = 0.0
+    def set(self, v): self.value = v; self.written_at = time.monotonic()
+    def age(self): return time.monotonic() - self.written_at if self.value else float("inf")
 
 local_cache = LocalCache()
-
-# Small in-process cache of validated key hashes so auth almost never
-# touches Redis (keeps command spend near the collection baseline — F-03).
 _key_cache: dict[str, tuple[float, dict]] = {}
-_KEY_CACHE_TTL = 300.0
+redis_client: aioredis.Redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
+async def _redis_get(key): return await redis_client.get(key)
+async def _redis_set(key, value, ex=None, nx=False): return await redis_client.set(key, value, ex=ex, nx=nx)
 
-# --------------------------------------------------------------------------- #
-# Redis access (always through the breaker)
-# --------------------------------------------------------------------------- #
-
-redis: aioredis.Redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-
-
-async def _redis_get(key: str) -> Optional[str]:
-    return await redis.get(key)
-
-
-async def _redis_set(key: str, value: str, ex: Optional[int] = None, nx: bool = False):
-    return await redis.set(key, value, ex=ex, nx=nx)
-
-
-# --------------------------------------------------------------------------- #
-# Collector
-# --------------------------------------------------------------------------- #
-
-
-@async_retry(max_attempts=4, timeout=5.0)
-async def fetch_source() -> dict:
-    """Raw HTTP pull from the source portal. Returns parsed JSON or raises."""
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.get(SOURCE_URL)
+@async_retry(max_attempts=2, timeout=8.0)
+async def probe_provider(client, provider):
+    t0 = time.monotonic()
+    try:
+        resp = await client.get(provider["url"], timeout=8.0)
         resp.raise_for_status()
-        return resp.json()
-
-
-def build_snapshot(probes: list[ProbeModel], aggregate: Aggregate) -> dict:
-    snap = TelemetrySnapshot(
-        snapshot_id=secrets.token_hex(16),
-        collected_at=datetime.now(timezone.utc),
-        ttl_seconds=CACHE_TTL_S,
-        schema_version=SCHEMA_VERSION,
-        probes=probes,
-        aggregate=aggregate,
-    )
-    return snap.model_dump(mode="json")
-
+        data = resp.json()
+        latency_ms = round((time.monotonic() - t0) * 1000, 2)
+        indicator = data.get("status", {}).get("indicator", "none")
+        incidents = [i for i in data.get("incidents", []) if i.get("status") not in ("resolved", "postmortem")]
+        components = [c for c in data.get("components", []) if c.get("status", "operational") != "operational"]
+        return ProviderProbe(
+            provider_id=provider["id"], provider_label=provider["label"],
+            status=INDICATOR_MAP.get(indicator, "degraded_performance"), indicator=indicator,
+            reachable=True, latency_ms=latency_ms,
+            active_incidents=len(incidents), active_components=len(components),
+            probe_timestamp=datetime.now(timezone.utc),
+        )
+    except Exception as exc:
+        log.warning("probe failed %s: %s", provider["id"], exc)
+        return ProviderProbe(
+            provider_id=provider["id"], provider_label=provider["label"],
+            status="unreachable", indicator="unknown", reachable=False, latency_ms=None,
+            active_incidents=0, active_components=0, probe_timestamp=datetime.now(timezone.utc),
+        )
 
 async def collection_cycle():
-    """3.6 — composes 3.1-3.5. On ANY failure, keep last-good cache untouched."""
     started = time.monotonic()
     try:
-        raw = await source_breaker.call(fetch_source)  # 3.1 + 3.2
-        probes = guard.check(raw.get("probes", []))  # 3.3 — rejects silent staleness
+        async with httpx.AsyncClient(headers={"User-Agent": "LLMFeed/2.0"}, timeout=10.0) as client:
+            probes = await asyncio.gather(*(probe_provider(client, p) for p in LLM_PROVIDERS))
         duration_ms = (time.monotonic() - started) * 1000
-        snapshot = build_snapshot(probes, compute_aggregate(probes, duration_ms))  # 3.4
-
-        await redis_breaker.call(_redis_set, "telemetry:latest", json.dumps(snapshot), CACHE_TTL_S)
-        local_cache.set(snapshot)  # warm the local read-through cache immediately
-        watchdog.record_success()  # 3.5
-        log.info("collection ok: %d probes", len(probes))
-    except Exception as exc:  # noqa: BLE001 — deliberate catch-all at the boundary
-        watchdog.record_failure()  # 3.5 — do NOT overwrite good cache
+        guard.check(probes)
+        snapshot = LLMFeedSnapshot(
+            snapshot_id=secrets.token_hex(16), collected_at=datetime.now(timezone.utc),
+            ttl_seconds=CACHE_TTL_S, schema_version=SCHEMA_VERSION,
+            providers=probes, aggregate=compute_aggregate(probes, duration_ms),
+        ).model_dump(mode="json")
+        await redis_breaker.call(_redis_set, "llmfeed:latest", json.dumps(snapshot), CACHE_TTL_S)
+        local_cache.set(snapshot)
+        watchdog.record_success()
+        log.info("collection ok: %d providers, %d incidents", len(probes), snapshot["aggregate"]["total_active_incidents"])
+    except Exception as exc:
+        watchdog.record_failure()
         log.error("collection failed, keeping last-good cache: %s", exc)
 
+def _hash_key(raw): return hashlib.sha256(raw.encode()).hexdigest()
 
-# --------------------------------------------------------------------------- #
-# Authentication — header API key, SHA-256, lookup-by-hash + local cache
-# --------------------------------------------------------------------------- #
-
-
-def _hash_key(raw_key: str) -> str:
-    return hashlib.sha256(raw_key.encode()).hexdigest()
-
-
-async def _lookup_key(key_hash: str) -> Optional[dict]:
+async def _lookup_key(key_hash):
     cached = _key_cache.get(key_hash)
-    if cached and (time.monotonic() - cached[0]) < _KEY_CACHE_TTL:
-        return cached[1]
+    if cached and (time.monotonic() - cached[0]) < 300.0: return cached[1]
     try:
         raw = await redis_breaker.call(_redis_get, f"apikey:{key_hash}")
     except Exception:
-        # Redis down: fall back to a possibly-stale local entry rather than 500 the world.
         return cached[1] if cached else None
-    if not raw:
-        return None
+    if not raw: return None
     meta = json.loads(raw)
     _key_cache[key_hash] = (time.monotonic(), meta)
     return meta
-
 
 async def validate_api_key(x_api_key: str = Header(...)) -> dict:
     if not x_api_key or not x_api_key.startswith("aota_"):
@@ -418,231 +241,112 @@ async def validate_api_key(x_api_key: str = Header(...)) -> dict:
         raise HTTPException(status_code=403, detail="Invalid or revoked API key")
     return meta
 
-
-# --------------------------------------------------------------------------- #
-# 3.8  Rate limiting — token bucket per key, 429 WITH Retry-After (F-08)
-# --------------------------------------------------------------------------- #
-
 TIER_HOURLY = {"free": 60, "pro": 600, "enterprise": 10_000_000}
-_buckets: dict[str, tuple[float, float]] = {}  # key_hash -> (tokens, last_refill)
+_buckets: dict[str, tuple[float, float]] = {}
 
-
-def _check_quota(key_hash: str, tier: str) -> tuple[bool, int]:
-    limit = TIER_HOURLY.get(tier, 60)
-    refill_per_s = limit / 3600.0
-    now = time.monotonic()
-    tokens, last = _buckets.get(key_hash, (float(limit), now))
+def _check_quota(key_hash, tier):
+    limit = TIER_HOURLY.get(tier, 60); refill_per_s = limit / 3600.0
+    now = time.monotonic(); tokens, last = _buckets.get(key_hash, (float(limit), now))
     tokens = min(float(limit), tokens + (now - last) * refill_per_s)
-    if tokens >= 1.0:
-        _buckets[key_hash] = (tokens - 1.0, now)
-        return True, 0
+    if tokens >= 1.0: _buckets[key_hash] = (tokens - 1.0, now); return True, 0
     _buckets[key_hash] = (tokens, now)
-    retry_after = max(1, int(round((1.0 - tokens) / refill_per_s)))
-    return False, retry_after
+    return False, max(1, int(round((1.0 - tokens) / refill_per_s)))
 
-
-# --------------------------------------------------------------------------- #
-# get_telemetry_cached — 3.7 read-through with stale flag
-# --------------------------------------------------------------------------- #
-
-
-async def get_telemetry_cached() -> tuple[Optional[dict], bool]:
-    if local_cache.value and local_cache.age() < LOCAL_FRESH_S:
-        return local_cache.value, False
+async def get_feed_cached():
+    if local_cache.value and local_cache.age() < LOCAL_FRESH_S: return local_cache.value, False
     try:
-        raw = await redis_breaker.call(_redis_get, "telemetry:latest")
+        raw = await redis_breaker.call(_redis_get, "llmfeed:latest")
         if raw:
-            data = json.loads(raw)
-            local_cache.set(data)
-            return data, False
-    except Exception:
-        pass
-    return local_cache.value, True  # Redis down / quota hit -> serve last local, flagged
+            data = json.loads(raw); local_cache.set(data); return data, False
+    except Exception: pass
+    return local_cache.value, True
 
-
-# --------------------------------------------------------------------------- #
-# Email (Resend HTTP API; swap base_url/payload for SendGrid if preferred)
-# --------------------------------------------------------------------------- #
-
-
-async def send_key_email(to_email: str, api_key: str) -> None:
-    if not RESEND_API_KEY:
-        log.warning("RESEND_API_KEY unset — skipping email (key still provisioned)")
-        return
-    body = {
-        "from": FROM_EMAIL,
-        "to": [to_email],
-        "subject": "Your AOTA API key",
-        "text": (
-            "Thanks for subscribing to AOTA telemetry.\n\n"
-            f"Your API key (store it securely — it is shown only once):\n\n{api_key}\n\n"
-            "Send it on every request as the header:  X-API-Key: <key>\n"
-            "Endpoint: GET /v1/telemetry\n"
-        ),
-    }
+async def send_key_email(to_email, api_key):
+    if not RESEND_API_KEY: return
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(
-            "https://api.resend.com/emails",
+        r = await client.post("https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-            json=body,
-        )
-        resp.raise_for_status()
-
-
-# --------------------------------------------------------------------------- #
-# App + lifespan (start scheduler, prime cache)
-# --------------------------------------------------------------------------- #
+            json={"from": FROM_EMAIL, "to": [to_email],
+                  "subject": "Your LLM Feed API key",
+                  "text": f"Your API key (shown once):\n\n    {api_key}\n\nGET /v1/telemetry  |  Header: X-API-Key: <key>"})
+        r.raise_for_status()
 
 scheduler = AsyncIOScheduler()
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await collection_cycle()  # prime so first client never hits an empty cache
-    scheduler.add_job(
-        collection_cycle,
-        "interval",
-        seconds=COLLECT_INTERVAL_S,
-        max_instances=1,  # single-flight: no overlapping cycles (F-09/F-10)
-        coalesce=True,
-    )
+    await collection_cycle()
+    scheduler.add_job(collection_cycle, "interval", seconds=COLLECT_INTERVAL_S, max_instances=1, coalesce=True)
     scheduler.start()
-    log.info("scheduler started; collecting every %ds", COLLECT_INTERVAL_S)
+    log.info("LLM feed running, collecting every %ds", COLLECT_INTERVAL_S)
     yield
     scheduler.shutdown(wait=False)
-    await redis.aclose()
+    await redis_client.aclose()
 
-
-app = FastAPI(title="AOTA", version=SCHEMA_VERSION, lifespan=lifespan)
-
-
-# --------------------------------------------------------------------------- #
-# Rate-limit middleware — exempts unauthenticated infra routes
-# --------------------------------------------------------------------------- #
-
-_EXEMPT_PATHS = {"/health", "/v1/provision"}
-
+app = FastAPI(title="LLM Availability Feed", version=SCHEMA_VERSION, lifespan=lifespan)
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-    if request.url.path in _EXEMPT_PATHS:
-        return await call_next(request)
-
+    if request.url.path in {"/health", "/v1/provision"}: return await call_next(request)
     api_key = request.headers.get("x-api-key", "")
-    if not api_key.startswith("aota_"):
-        return await call_next(request)  # let the auth dependency reject it with 401
-
-    key_hash = _hash_key(api_key)
-    meta = await _lookup_key(key_hash)
-    tier = (meta or {}).get("tier", "free")
-    allowed, retry_after = _check_quota(key_hash, tier)
+    if not api_key.startswith("aota_"): return await call_next(request)
+    key_hash = _hash_key(api_key); meta = await _lookup_key(key_hash)
+    allowed, retry_after = _check_quota(key_hash, (meta or {}).get("tier", "free"))
     if not allowed:
-        return JSONResponse(
-            status_code=429,
+        return JSONResponse(status_code=429,
             content={"error": "rate_limited", "retry_after_seconds": retry_after},
-            headers={"Retry-After": str(retry_after)},  # F-08: the field clients obey
-        )
+            headers={"Retry-After": str(retry_after)})
     return await call_next(request)
-
-
-# --------------------------------------------------------------------------- #
-# Routes
-# --------------------------------------------------------------------------- #
-
 
 @app.get("/v1/telemetry")
 async def get_telemetry(response: Response, _key: dict = Depends(validate_api_key)):
     try:
-        data, is_stale = await asyncio.wait_for(get_telemetry_cached(), timeout=2.0)  # 3.8 budget
+        data, is_stale = await asyncio.wait_for(get_feed_cached(), timeout=2.0)
     except asyncio.TimeoutError:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "telemetry_unavailable", "retry_after_seconds": 30},
-            headers={"Retry-After": "30"},  # F-04/F-15 correct semantics
-        )
-
+        return JSONResponse(503, {"error": "feed_unavailable", "retry_after_seconds": 30}, headers={"Retry-After": "30"})
     if data is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "no_data_yet"},
-            headers={"Retry-After": "60"},
-        )
-
-    payload = TelemetrySnapshot(**data).model_dump(mode="json")  # F-07/F-13 frozen shape
+        return JSONResponse(503, {"error": "no_data_yet"}, headers={"Retry-After": "60"})
+    payload = LLMFeedSnapshot(**data).model_dump(mode="json")
     response.headers["X-Data-Stale"] = "true" if is_stale else "false"
     response.headers["Cache-Control"] = "public, max-age=30"
     return payload
 
-
 @app.get("/health")
 async def health():
-    scheduler_ok = watchdog.is_healthy()
-    cache_present = local_cache.value is not None
-    cache_age = round(local_cache.age(), 1) if cache_present else None
-    status = "ok" if (scheduler_ok and cache_present) else "degraded"  # 3.9, F-04/F-06
+    ok = watchdog.is_healthy(); present = local_cache.value is not None
+    ops = (local_cache.value or {}).get("aggregate", {}).get("operational_count", 0) if present else 0
     return {
-        "status": status,
+        "status": "ok" if (ok and present) else "degraded",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "scheduler_healthy": scheduler_ok,
+        "scheduler_healthy": ok,
         "seconds_since_collection": round(watchdog.seconds_since_success(), 1),
-        "cache_populated": cache_present,
-        "cache_age_seconds": cache_age,
+        "cache_populated": present,
+        "cache_age_seconds": round(local_cache.age(), 1) if present else None,
+        "providers_operational": ops,
         "version": SCHEMA_VERSION,
     }
 
-
 @app.post("/v1/provision")
 async def provision(request: Request):
-    """Stripe checkout.session.completed -> generate key -> hash to Redis -> email.
-
-    SECURITY: the request body is untrusted until the Stripe signature is
-    verified. We never act on payload contents before construct_event() passes.
-    """
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=503, detail="provisioning not configured")
-
-    payload = await request.body()
-    sig = request.headers.get("stripe-signature", "")
+    if not STRIPE_WEBHOOK_SECRET: raise HTTPException(503, "provisioning not configured")
+    payload = await request.body(); sig = request.headers.get("stripe-signature", "")
     try:
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except (ValueError, stripe.error.SignatureVerificationError):
-        raise HTTPException(status_code=400, detail="invalid signature")
-
-    if event["type"] != "checkout.session.completed":
-        return {"ignored": event["type"]}
-
-    # F-14: idempotency — SETNX on event id dedupes Stripe retries / replays.
-    first_time = await redis_breaker.call(
-        _redis_set, f"stripe:evt:{event['id']}", "1", 60 * 60 * 24 * 7, True
-    )
-    if not first_time:
-        return {"status": "already_processed", "event_id": event["id"]}
-
+        raise HTTPException(400, "invalid signature")
+    if event["type"] != "checkout.session.completed": return {"ignored": event["type"]}
+    first_time = await redis_breaker.call(_redis_set, f"stripe:evt:{event['id']}", "1", 604800, True)
+    if not first_time: return {"status": "already_processed"}
     session = event["data"]["object"]
     email = (session.get("customer_details") or {}).get("email") or session.get("customer_email")
     tier = (session.get("metadata") or {}).get("tier", "pro")
-    if not email:
-        log.error("no email on session %s", session.get("id"))
-        raise HTTPException(status_code=422, detail="no customer email")
-
-    raw_key = f"aota_{tier}_{secrets.token_hex(16)}"  # 32 hex chars
-    meta = {
-        "tier": tier,
-        "active": True,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "stripe_session": session.get("id"),
-    }
-    # Store ONLY the hash. Plaintext key leaves the server exactly once, by email.
-    await redis_breaker.call(
-        _redis_set, f"apikey:{_hash_key(raw_key)}", json.dumps(meta), None, False
-    )
-
+    if not email: raise HTTPException(422, "no customer email")
+    raw_key = f"aota_{tier}_{secrets.token_hex(16)}"
+    await redis_breaker.call(_redis_set, f"apikey:{_hash_key(raw_key)}",
+        json.dumps({"tier": tier, "active": True, "created_at": datetime.now(timezone.utc).isoformat(), "stripe_session": session.get("id")}))
     try:
         await send_key_email(email, raw_key)
-    except Exception as exc:  # noqa: BLE001
-        # Key is provisioned; email failed. Log loudly — this is the one spot a human
-        # may need to intervene. Do not leak the key to logs.
+    except Exception as exc:
         log.error("key provisioned for %s but email failed: %s", email, exc)
         return {"status": "provisioned_email_failed", "tier": tier}
-
     return {"status": "provisioned", "tier": tier}
