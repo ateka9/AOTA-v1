@@ -1,6 +1,5 @@
-# AOTA v1 — Render Infrastructure as Code.
-# Keep-warm: register /health with UptimeRobot (free, uptimerobot.com)
-# and set it to ping every 5 minutes. No paid cron service needed.
+# AOTA v1 — LLM Availability Feed
+# Keep-warm: register /health with UptimeRobot (free) every 5 minutes.
 
 services:
   - type: web
@@ -15,8 +14,6 @@ services:
       - key: PYTHON_VERSION
         value: "3.12.7"
       - key: UPSTASH_REDIS_URL
-        sync: false
-      - key: SOURCE_PORTAL_URL
         sync: false
       - key: STRIPE_API_KEY
         sync: false
