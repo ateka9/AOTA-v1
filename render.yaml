@@ -1,17 +1,12 @@
 # AOTA v1 — Render Infrastructure as Code.
-# Deploy: connect this repo in the Render dashboard; Render reads render.yaml.
-#
-# The single web service runs uvicorn + the in-process APScheduler collector
-# (the architecture from the spec). A free-tier cron job pings /health every
-# 10 min as the keep-warm pinger that narrows the cold-start window (F-02).
-# NOTE: per the audit's Section 4, the free tier has NO availability SLA.
-# Once a paying stranger appears, migrate the web service to the paid plan.
+# Keep-warm: register /health with UptimeRobot (free, uptimerobot.com)
+# and set it to ping every 5 minutes. No paid cron service needed.
 
 services:
   - type: web
     name: aota-api
     runtime: python
-    plan: free                       # <- the "demo" tier. Upgrade on first real customer.
+    plan: free
     region: oregon
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
@@ -20,7 +15,7 @@ services:
       - key: PYTHON_VERSION
         value: "3.12.7"
       - key: UPSTASH_REDIS_URL
-        sync: false                  # set in dashboard; never commit secrets
+        sync: false
       - key: SOURCE_PORTAL_URL
         sync: false
       - key: STRIPE_API_KEY
@@ -37,14 +32,3 @@ services:
         value: "55"
       - key: MAX_DATA_AGE_S
         value: "180"
-
-  - type: cron
-    name: aota-keepwarm
-    runtime: python
-    plan: free
-    schedule: "*/10 * * * *"         # every 10 minutes
-    buildCommand: "pip install httpx==0.28.1"
-    startCommand: "python -c \"import httpx,os;httpx.get(os.environ['KEEPWARM_URL'],timeout=30)\""
-    envVars:
-      - key: KEEPWARM_URL
-        sync: false                  # set to https://<your-service>.onrender.com/health
