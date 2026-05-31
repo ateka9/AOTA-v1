@@ -1,9 +1,5 @@
 """
 LLM Availability Feed — Production API (v2)
-
-Probes every 60 seconds:
-  OpenAI, Anthropic, Cohere, Mistral, Groq,
-  Together AI, Perplexity, Replicate, Hugging Face
 """
 from __future__ import annotations
 import asyncio, functools, hashlib, json, logging, os, random, secrets, time
@@ -21,12 +17,12 @@ from pydantic import BaseModel, field_validator
 
 LLM_PROVIDERS = [
     {"id": "openai",      "label": "OpenAI",       "url": "https://status.openai.com/api/v2/summary.json"},
-    {"id": "anthropic",   "label": "Anthropic",     "url": "https://status.anthropic.com/api/v2/summary.json"},
+    {"id": "anthropic",   "label": "Anthropic",     "url": "https://status.claude.com/api/v2/summary.json"},
     {"id": "cohere",      "label": "Cohere",        "url": "https://status.cohere.com/api/v2/summary.json"},
-    {"id": "mistral",     "label": "Mistral",       "url": "https://mistralstatus.com/api/v2/summary.json"},
+    {"id": "mistral",     "label": "Mistral",       "url": "https://status.mistral.ai/api/v2/summary.json"},
     {"id": "groq",        "label": "Groq",          "url": "https://groqstatus.com/api/v2/summary.json"},
     {"id": "together",    "label": "Together AI",   "url": "https://status.together.ai/api/v2/summary.json"},
-    {"id": "perplexity",  "label": "Perplexity",    "url": "https://status.perplexity.ai/api/v2/summary.json"},
+    {"id": "perplexity",  "label": "Perplexity",    "url": "https://status.perplexity.com/api/v2/summary.json"},
     {"id": "replicate",   "label": "Replicate",     "url": "https://replicatestatus.com/api/v2/summary.json"},
     {"id": "huggingface", "label": "Hugging Face",  "url": "https://status.huggingface.co/api/v2/summary.json"},
 ]
@@ -173,11 +169,11 @@ redis_client: aioredis.Redis = aioredis.from_url(REDIS_URL, decode_responses=Tru
 async def _redis_get(key): return await redis_client.get(key)
 async def _redis_set(key, value, ex=None, nx=False): return await redis_client.set(key, value, ex=ex, nx=nx)
 
-@async_retry(max_attempts=2, timeout=8.0)
+@async_retry(max_attempts=2, timeout=10.0)
 async def probe_provider(client, provider):
     t0 = time.monotonic()
     try:
-        resp = await client.get(provider["url"], timeout=8.0)
+        resp = await client.get(provider["url"], timeout=10.0)
         resp.raise_for_status()
         data = resp.json()
         latency_ms = round((time.monotonic() - t0) * 1000, 2)
@@ -202,7 +198,7 @@ async def probe_provider(client, provider):
 async def collection_cycle():
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient(headers={"User-Agent": "LLMFeed/2.0"}, timeout=10.0) as client:
+        async with httpx.AsyncClient(headers={"User-Agent": "LLMFeed/2.0"}, timeout=12.0) as client:
             probes = await asyncio.gather(*(probe_provider(client, p) for p in LLM_PROVIDERS))
         duration_ms = (time.monotonic() - started) * 1000
         guard.check(probes)
