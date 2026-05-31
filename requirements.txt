@@ -1,0 +1,10 @@
+# AOTA v1 — pinned dependencies. Pin exact versions; never "latest".
+# Verify against PyPI before deploy; bump deliberately, not incidentally.
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+httpx==0.28.1
+redis==5.2.1
+APScheduler==3.11.0
+stripe==11.4.1
