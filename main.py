@@ -1,5 +1,13 @@
 """
-LLM Availability Feed — Production API (v2)
+LLM Availability Feed — Production API (v2.1)
+
+Direct endpoint probing — measures actual API reachability, not self-reported
+status pages. A 401 in 200ms means the provider is UP. A timeout means DOWN.
+This is more honest data than any status page.
+
+Providers probed:
+  OpenAI, Anthropic, Cohere, Mistral, Groq, Together AI,
+  Perplexity, Replicate, Hugging Face
 """
 from __future__ import annotations
 import asyncio, functools, hashlib, json, logging, os, random, secrets, time
@@ -15,22 +23,65 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
+# --------------------------------------------------------------------------- #
+# Direct endpoint probes — no API key needed, 401 = server is alive
+# --------------------------------------------------------------------------- #
 LLM_PROVIDERS = [
-    {"id": "openai",      "label": "OpenAI",       "url": "https://status.openai.com/api/v2/summary.json"},
-    {"id": "anthropic",   "label": "Anthropic",     "url": "https://status.claude.com/api/v2/summary.json"},
-    {"id": "cohere",      "label": "Cohere",        "url": "https://status.cohere.com/api/v2/summary.json"},
-    {"id": "mistral",     "label": "Mistral",       "url": "https://status.mistral.ai/api/v2/summary.json"},
-    {"id": "groq",        "label": "Groq",          "url": "https://groqstatus.com/api/v2/summary.json"},
-    {"id": "together",    "label": "Together AI",   "url": "https://status.together.ai/api/v2/summary.json"},
-    {"id": "perplexity",  "label": "Perplexity",    "url": "https://status.perplexity.com/api/v2/summary.json"},
-    {"id": "replicate",   "label": "Replicate",     "url": "https://replicatestatus.com/api/v2/summary.json"},
-    {"id": "huggingface", "label": "Hugging Face",  "url": "https://status.huggingface.co/api/v2/summary.json"},
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "url": "https://api.openai.com/v1/models",
+        "expected_codes": [200, 401],
+    },
+    {
+        "id": "anthropic",
+        "label": "Anthropic",
+        "url": "https://api.anthropic.com/v1/models",
+        "expected_codes": [200, 401],
+    },
+    {
+        "id": "cohere",
+        "label": "Cohere",
+        "url": "https://api.cohere.com/v1/models",
+        "expected_codes": [200, 401],
+    },
+    {
+        "id": "mistral",
+        "label": "Mistral",
+        "url": "https://api.mistral.ai/v1/models",
+        "expected_codes": [200, 401],
+    },
+    {
+        "id": "groq",
+        "label": "Groq",
+        "url": "https://api.groq.com/openai/v1/models",
+        "expected_codes": [200, 401],
+    },
+    {
+        "id": "together",
+        "label": "Together AI",
+        "url": "https://api.together.xyz/v1/models",
+        "expected_codes": [200, 401],
+    },
+    {
+        "id": "perplexity",
+        "label": "Perplexity",
+        "url": "https://api.perplexity.ai/models",
+        "expected_codes": [200, 401, 404],
+    },
+    {
+        "id": "replicate",
+        "label": "Replicate",
+        "url": "https://api.replicate.com/v1/models",
+        "expected_codes": [200, 401],
+    },
+    {
+        "id": "huggingface",
+        "label": "Hugging Face",
+        "url": "https://huggingface.co/api/models?limit=1",
+        "expected_codes": [200, 401],
+    },
 ]
-
-INDICATOR_MAP = {
-    "none": "operational", "minor": "degraded_performance",
-    "major": "major_outage", "critical": "major_outage", "maintenance": "under_maintenance",
-}
 
 REDIS_URL             = os.environ["UPSTASH_REDIS_URL"]
 STRIPE_API_KEY        = os.environ.get("STRIPE_API_KEY", "")
@@ -41,7 +92,7 @@ COLLECT_INTERVAL_S    = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
 CACHE_TTL_S           = int(os.environ.get("CACHE_TTL_S", "55"))
 LOCAL_FRESH_S         = int(os.environ.get("LOCAL_FRESH_S", "50"))
 MAX_DATA_AGE_S        = int(os.environ.get("MAX_DATA_AGE_S", "180"))
-SCHEMA_VERSION        = "2.0.0"
+SCHEMA_VERSION        = "2.1.0"
 
 stripe.api_key = STRIPE_API_KEY
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -96,9 +147,14 @@ class CircuitBreaker:
 redis_breaker = CircuitBreaker(fail_threshold=3, cooldown=15.0)
 
 class ProviderProbe(BaseModel):
-    provider_id: str; provider_label: str; status: str; indicator: str
-    reachable: bool; latency_ms: Optional[float]
-    active_incidents: int; active_components: int; probe_timestamp: datetime
+    provider_id: str
+    provider_label: str
+    status: str          # operational | degraded | unreachable
+    reachable: bool
+    status_code: Optional[int]
+    latency_ms: Optional[float]
+    probe_timestamp: datetime
+
     @field_validator("latency_ms")
     @classmethod
     def latency_sane(cls, v):
@@ -107,14 +163,21 @@ class ProviderProbe(BaseModel):
         return v
 
 class FeedAggregate(BaseModel):
-    total_providers: int; operational_count: int; degraded_count: int
-    outage_count: int; unreachable_count: int; total_active_incidents: int
-    avg_latency_ms: Optional[float]; collection_duration_ms: float
+    total_providers: int
+    operational_count: int
+    degraded_count: int
+    unreachable_count: int
+    avg_latency_ms: Optional[float]
+    p95_latency_ms: Optional[float]
+    collection_duration_ms: float
 
 class LLMFeedSnapshot(BaseModel):
-    snapshot_id: str; collected_at: datetime; ttl_seconds: int
+    snapshot_id: str
+    collected_at: datetime
+    ttl_seconds: int
     schema_version: str = SCHEMA_VERSION
-    providers: list[ProviderProbe]; aggregate: FeedAggregate
+    providers: list[ProviderProbe]
+    aggregate: FeedAggregate
 
 class StalenessGuard:
     def __init__(self):
@@ -126,7 +189,10 @@ class StalenessGuard:
             ts = p.probe_timestamp.astimezone(timezone.utc)
             if abs((now - ts).total_seconds()) > MAX_DATA_AGE_S:
                 raise ValueError(f"probe_timestamp skewed: {ts.isoformat()}")
-        h = hashlib.sha256(json.dumps([p.model_dump(mode="json") for p in probes], sort_keys=True, default=str).encode()).hexdigest()
+        h = hashlib.sha256(
+            json.dumps([p.model_dump(mode="json") for p in probes],
+                       sort_keys=True, default=str).encode()
+        ).hexdigest()
         if h == self.last_hash:
             if time.monotonic() - self.last_change_at > MAX_DATA_AGE_S:
                 raise ValueError("feed frozen")
@@ -136,15 +202,15 @@ class StalenessGuard:
 guard = StalenessGuard()
 
 def compute_aggregate(probes, duration_ms):
-    lats = [p.latency_ms for p in probes if p.latency_ms is not None]
+    lats = sorted(p.latency_ms for p in probes if p.latency_ms is not None)
+    def p95(v): return round(v[max(0, int(0.95*(len(v)-1)))], 2) if v else None
     return FeedAggregate(
         total_providers=len(probes),
         operational_count=sum(1 for p in probes if p.status == "operational"),
-        degraded_count=sum(1 for p in probes if p.status == "degraded_performance"),
-        outage_count=sum(1 for p in probes if p.status == "major_outage"),
+        degraded_count=sum(1 for p in probes if p.status == "degraded"),
         unreachable_count=sum(1 for p in probes if not p.reachable),
-        total_active_incidents=sum(p.active_incidents for p in probes),
         avg_latency_ms=round(sum(lats)/len(lats), 2) if lats else None,
+        p95_latency_ms=p95(lats),
         collection_duration_ms=round(duration_ms, 2),
     )
 
@@ -169,48 +235,75 @@ redis_client: aioredis.Redis = aioredis.from_url(REDIS_URL, decode_responses=Tru
 async def _redis_get(key): return await redis_client.get(key)
 async def _redis_set(key, value, ex=None, nx=False): return await redis_client.set(key, value, ex=ex, nx=nx)
 
-@async_retry(max_attempts=2, timeout=10.0)
-async def probe_provider(client, provider):
+@async_retry(max_attempts=2, timeout=8.0)
+async def probe_provider(client: httpx.AsyncClient, provider: dict) -> ProviderProbe:
+    """
+    Probes the provider's actual API endpoint directly.
+    401 = server alive and responding (we just have no key) = operational.
+    Timeout or connection error = unreachable.
+    5xx = degraded.
+    """
     t0 = time.monotonic()
     try:
-        resp = await client.get(provider["url"], timeout=10.0)
-        resp.raise_for_status()
-        data = resp.json()
+        resp = await client.get(
+            provider["url"],
+            timeout=8.0,
+            headers={"User-Agent": "LLMFeed/2.1 uptime-probe"},
+        )
         latency_ms = round((time.monotonic() - t0) * 1000, 2)
-        indicator = data.get("status", {}).get("indicator", "none")
-        incidents = [i for i in data.get("incidents", []) if i.get("status") not in ("resolved", "postmortem")]
-        components = [c for c in data.get("components", []) if c.get("status", "operational") != "operational"]
+        code = resp.status_code
+        expected = provider.get("expected_codes", [200, 401])
+
+        if code in expected:
+            status = "operational"
+        elif 500 <= code < 600:
+            status = "degraded"
+        else:
+            status = "operational"  # any response = server is up
+
         return ProviderProbe(
-            provider_id=provider["id"], provider_label=provider["label"],
-            status=INDICATOR_MAP.get(indicator, "degraded_performance"), indicator=indicator,
-            reachable=True, latency_ms=latency_ms,
-            active_incidents=len(incidents), active_components=len(components),
+            provider_id=provider["id"],
+            provider_label=provider["label"],
+            status=status,
+            reachable=True,
+            status_code=code,
+            latency_ms=latency_ms,
             probe_timestamp=datetime.now(timezone.utc),
         )
     except Exception as exc:
         log.warning("probe failed %s: %s", provider["id"], exc)
         return ProviderProbe(
-            provider_id=provider["id"], provider_label=provider["label"],
-            status="unreachable", indicator="unknown", reachable=False, latency_ms=None,
-            active_incidents=0, active_components=0, probe_timestamp=datetime.now(timezone.utc),
+            provider_id=provider["id"],
+            provider_label=provider["label"],
+            status="unreachable",
+            reachable=False,
+            status_code=None,
+            latency_ms=None,
+            probe_timestamp=datetime.now(timezone.utc),
         )
 
 async def collection_cycle():
     started = time.monotonic()
     try:
-        async with httpx.AsyncClient(headers={"User-Agent": "LLMFeed/2.0"}, timeout=12.0) as client:
-            probes = await asyncio.gather(*(probe_provider(client, p) for p in LLM_PROVIDERS))
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            probes = await asyncio.gather(
+                *(probe_provider(client, p) for p in LLM_PROVIDERS)
+            )
         duration_ms = (time.monotonic() - started) * 1000
         guard.check(probes)
         snapshot = LLMFeedSnapshot(
-            snapshot_id=secrets.token_hex(16), collected_at=datetime.now(timezone.utc),
-            ttl_seconds=CACHE_TTL_S, schema_version=SCHEMA_VERSION,
-            providers=probes, aggregate=compute_aggregate(probes, duration_ms),
+            snapshot_id=secrets.token_hex(16),
+            collected_at=datetime.now(timezone.utc),
+            ttl_seconds=CACHE_TTL_S,
+            schema_version=SCHEMA_VERSION,
+            providers=probes,
+            aggregate=compute_aggregate(probes, duration_ms),
         ).model_dump(mode="json")
         await redis_breaker.call(_redis_set, "llmfeed:latest", json.dumps(snapshot), CACHE_TTL_S)
         local_cache.set(snapshot)
         watchdog.record_success()
-        log.info("collection ok: %d providers, %d incidents", len(probes), snapshot["aggregate"]["total_active_incidents"])
+        ops = snapshot["aggregate"]["operational_count"]
+        log.info("collection ok: %d/%d operational, %.0fms", ops, len(probes), duration_ms)
     except Exception as exc:
         watchdog.record_failure()
         log.error("collection failed, keeping last-good cache: %s", exc)
@@ -260,11 +353,22 @@ async def get_feed_cached():
 async def send_key_email(to_email, api_key):
     if not RESEND_API_KEY: return
     async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post("https://api.resend.com/emails",
+        r = await client.post(
+            "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-            json={"from": FROM_EMAIL, "to": [to_email],
-                  "subject": "Your LLM Feed API key",
-                  "text": f"Your API key (shown once):\n\n    {api_key}\n\nGET /v1/telemetry  |  Header: X-API-Key: <key>"})
+            json={
+                "from": FROM_EMAIL,
+                "to": [to_email],
+                "subject": "Your LLM Feed API key",
+                "text": (
+                    f"Your API key (shown once):\n\n    {api_key}\n\n"
+                    "Usage:\n"
+                    "  GET https://aota-api.onrender.com/v1/telemetry\n"
+                    "  Header: X-API-Key: <your-key>\n\n"
+                    "Updated every 60 seconds. Covers 9 providers."
+                ),
+            },
+        )
         r.raise_for_status()
 
 scheduler = AsyncIOScheduler()
@@ -272,7 +376,10 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await collection_cycle()
-    scheduler.add_job(collection_cycle, "interval", seconds=COLLECT_INTERVAL_S, max_instances=1, coalesce=True)
+    scheduler.add_job(
+        collection_cycle, "interval",
+        seconds=COLLECT_INTERVAL_S, max_instances=1, coalesce=True,
+    )
     scheduler.start()
     log.info("LLM feed running, collecting every %ds", COLLECT_INTERVAL_S)
     yield
@@ -289,9 +396,11 @@ async def rate_limit(request: Request, call_next):
     key_hash = _hash_key(api_key); meta = await _lookup_key(key_hash)
     allowed, retry_after = _check_quota(key_hash, (meta or {}).get("tier", "free"))
     if not allowed:
-        return JSONResponse(status_code=429,
+        return JSONResponse(
+            status_code=429,
             content={"error": "rate_limited", "retry_after_seconds": retry_after},
-            headers={"Retry-After": str(retry_after)})
+            headers={"Retry-After": str(retry_after)},
+        )
     return await call_next(request)
 
 @app.get("/v1/telemetry")
@@ -331,15 +440,24 @@ async def provision(request: Request):
     except (ValueError, stripe.error.SignatureVerificationError):
         raise HTTPException(400, "invalid signature")
     if event["type"] != "checkout.session.completed": return {"ignored": event["type"]}
-    first_time = await redis_breaker.call(_redis_set, f"stripe:evt:{event['id']}", "1", 604800, True)
+    first_time = await redis_breaker.call(
+        _redis_set, f"stripe:evt:{event['id']}", "1", 604800, True
+    )
     if not first_time: return {"status": "already_processed"}
     session = event["data"]["object"]
     email = (session.get("customer_details") or {}).get("email") or session.get("customer_email")
     tier = (session.get("metadata") or {}).get("tier", "pro")
     if not email: raise HTTPException(422, "no customer email")
     raw_key = f"aota_{tier}_{secrets.token_hex(16)}"
-    await redis_breaker.call(_redis_set, f"apikey:{_hash_key(raw_key)}",
-        json.dumps({"tier": tier, "active": True, "created_at": datetime.now(timezone.utc).isoformat(), "stripe_session": session.get("id")}))
+    await redis_breaker.call(
+        _redis_set,
+        f"apikey:{_hash_key(raw_key)}",
+        json.dumps({
+            "tier": tier, "active": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "stripe_session": session.get("id"),
+        }),
+    )
     try:
         await send_key_email(email, raw_key)
     except Exception as exc:
